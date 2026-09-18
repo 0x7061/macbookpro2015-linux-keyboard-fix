@@ -2,6 +2,17 @@
 
 Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. Compiled 18 Sept 2026.
 
+## Script Use
+```
+./mbp12-omarchy-fix.sh --dry-run        # read the diffs
+./mbp12-omarchy-fix.sh                  # everything except hibernation
+# reboot (USB keyboard attached)
+./mbp12-omarchy-fix.sh --verify
+sudo omarchy-hibernation-setup          # if not already done
+./mbp12-omarchy-fix.sh --phase hibernation
+./mbp12-omarchy-fix.sh --verify && systemctl hibernate
+```
+
 ---
 
 ## 1. Root cause

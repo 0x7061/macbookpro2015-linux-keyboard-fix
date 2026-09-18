@@ -1,6 +1,6 @@
 # MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, Limine + LUKS, busybox initramfs. Compiled 18 Sept 2026.
+Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. Compiled 18 Sept 2026.
 
 ---
 
@@ -231,7 +231,81 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 
 ---
 
-## 7. Files touched (summary)
+## 7. Hibernation (btrfs swapfile on a top-level `@swap` subvolume)
+
+Omarchy's `omarchy-hibernation-setup` creates the swapfile in a subvolume **nested under `@`** (`@/swap`). systemd ≥ 259 refuses to hibernate into that (`CanHibernate` reports unavailable, `systemctl hibernate` silently does nothing). Fix: move it to a top-level `@swap` subvolume mounted at `/swap` (same layout as Omarchy PR #12176).
+
+### 7.1 Diagnose
+
+```bash
+busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate   # want: s "yes"
+# NOTE: `systemctl show -p CanHibernate` prints nothing either way — it is a logind property, not a PID-1 one.
+swapon --show                                          # PRIO must be >= 0 (negative priority swap is ignored for hibernation)
+sudo btrfs subvolume list / | grep -i swap             # want: "top level 5 path @swap"; "top level 256 path swap" = nested (bad)
+findmnt /swap                                          # want: subvol=/@swap
+grep -oE "resume=[^ ]*|resume_offset=[^ ]*" /proc/cmdline
+sudo btrfs inspect-internal map-swapfile -r /swap/swapfile   # must equal resume_offset
+```
+
+### 7.2 Move the swapfile to a top-level subvolume
+
+```bash
+sudo swapoff /swap/swapfile
+sudo mkdir -p /mnt/top
+sudo mount -t btrfs -o subvolid=5 /dev/mapper/root /mnt/top
+sudo btrfs subvolume delete /mnt/top/@/swap
+sudo btrfs subvolume create /mnt/top/@swap
+sudo chattr +C /mnt/top/@swap
+sudo umount /mnt/top
+sudo mkdir -p /swap
+```
+
+`sudo nano /etc/fstab` — mount line **above** the swapfile line:
+
+```
+/dev/mapper/root  /swap  btrfs  subvol=@swap,nodatacow,noatime  0 0
+/swap/swapfile    none   swap   defaults,pri=0                  0 0
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo mount /swap
+sudo btrfs filesystem mkswapfile --size 18g /swap/swapfile      # RAM (16 GB) + 2 GB headroom
+sudo swapon -a                                                  # via fstab, so it gets pri=0 (a bare `swapon` gives -1)
+OFF=$(sudo btrfs inspect-internal map-swapfile -r /swap/swapfile); echo $OFF
+sudo sed -i "s/resume_offset=[0-9]*/resume_offset=$OFF/" /etc/limine-entry-tool.d/resume.conf /etc/default/limine
+sudo limine-update
+```
+
+The `resume` initramfs hook and `resume=/dev/mapper/root resume_offset=…` kernel parameters were already in place from `omarchy-hibernation-setup` (`/etc/mkinitcpio.conf.d/omarchy_resume.conf`, `/etc/limine-entry-tool.d/resume.conf`).
+
+### 7.3 Test and read the log correctly
+
+```bash
+systemctl hibernate        # machine powers off; power on → LUKS prompt (built-in keyboard works) → session restored
+sudo journalctl -b -o short-iso --no-pager | grep -iE "hibernation entry|hibernation exit" | tail -2
+```
+
+A resumed system keeps the *same boot ID* and its log is the memory snapshot taken **before** the image was written, so `journalctl -b -1` is empty and you will not see "Image saving" or "Image restored" lines. Success is: a wall-clock gap of tens of seconds between `hibernation entry` and `hibernation exit` while monotonic time barely moves, followed by `modeswitch done` and `brcmfmac` re-registering (the sleep hook's `post` phase). An abort shows a ~1 s gap and an error between the two lines.
+
+### 7.4 Optional: suspend-then-hibernate on lid close
+
+```ini
+# /etc/systemd/sleep.conf.d/hibernate-delay.conf
+[Sleep]
+HibernateDelaySec=2h
+
+# /etc/systemd/logind.conf.d/lid.conf
+[Login]
+HandleLidSwitch=suspend-then-hibernate
+HandleLidSwitchExternalPower=suspend-then-hibernate
+```
+
+`sudo systemctl restart systemd-logind` (logs you out) or reboot. The sleep hook runs `pre` once at the start and `post` once at the final wake, so applespi and brcmfmac are handled across the s2idle → hibernate transition. `rtc_cmos.use_acpi_alarm=1` (added by Omarchy's setup) lets the timer fire while asleep.
+
+---
+
+## 8. Files touched (summary)
 
 | File | Purpose |
 |---|---|
@@ -243,10 +317,12 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
 | `/usr/lib/systemd/system-sleep/applespi` | detach/reattach `applespi` + `brcmfmac` around suspend |
+| `/etc/fstab` | `@swap` subvolume mounted at `/swap` + swapfile with `pri=0` |
+| `/etc/limine-entry-tool.d/resume.conf` | `resume=/dev/mapper/root resume_offset=<from map-swapfile>` (written by Omarchy, offset updated) |
 
 ---
 
-## 8. Maintenance & quirks
+## 9. Maintenance & quirks
 
 - `acpi_call` is DKMS: rebuilds on kernel updates as long as `linux-omarchy-headers` stays installed. Check `sudo dkms status`, `ls /lib/modules/$(uname -r)/updates/dkms/`.
 - `mkinitcpio -P` runs on kernel updates and picks the hook up automatically.
@@ -257,7 +333,7 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -268,10 +344,12 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 | `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
+| `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
+| `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
 
 ---
 
-## 10. Sources
+## 11. Sources
 
 - Omarchy manual, Mac support — `omarchy.org/manual/mac-support/`
 - Omarchy issue #1954 (MacBook8,1 applespi timeouts, DMA root cause) · PR #9735 (PIO switch for 8,1)

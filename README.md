@@ -198,18 +198,34 @@ MemorySleepMode=s2idle
 
 ### 6.2 `/usr/lib/systemd/system-sleep/applespi`
 
+Two things must be detached before sleep: `applespi` (wedges otherwise) and the Broadcom Wi-Fi driver `brcmfmac` (fails to enter D3 with `-5`, which aborts the suspend and makes systemd retry in a loop — the "lid logo blinks every few seconds" symptom).
+
 ```sh
 #!/bin/sh
 case "$1" in
-    pre)  modprobe -r applespi ;;
-    post) /usr/local/bin/applespi-force ;;
+    pre)
+        modprobe -r applespi
+        modprobe -r brcmfmac_wcc 2>/dev/null
+        modprobe -r brcmfmac
+        ;;
+    post)
+        modprobe brcmfmac
+        /usr/local/bin/applespi-force
+        ;;
 esac
 ```
 
+If `modprobe -r brcmfmac` ever reports "in use", add `nmcli radio wifi off` before the unload and `nmcli radio wifi on` after the reload.
+
 ```bash
 sudo chmod 755 /usr/lib/systemd/system-sleep/applespi
-systemctl suspend      # test; after wake: sudo dmesg | grep -i applespi | tail -3 → fresh "modeswitch done"
+systemctl suspend      # test, then after wake:
+sudo journalctl -b -o short-monotonic | grep -iE "PM: |brcmfmac|Failed to put" | tail -15
+#   good: one "suspend entry (s2idle)" → "suspend exit", no "returns -5", Wi-Fi re-registers
+nmcli device status    # wifi connected again
 ```
+
+Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. If the journal shows `Some devices failed to suspend` / `Failed to put system to sleep`, it is a device refusing to suspend, not a wake source.
 
 Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set up hibernation (needs a disk-backed swapfile with non-negative priority; zram alone won't hibernate — see the matthiasjg gist for suspend-then-hibernate).
 
@@ -226,7 +242,7 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 | `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt |
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
-| `/usr/lib/systemd/system-sleep/applespi` | detach/reattach around suspend |
+| `/usr/lib/systemd/system-sleep/applespi` | detach/reattach `applespi` + `brcmfmac` around suspend |
 
 ---
 
@@ -251,6 +267,7 @@ Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set 
 | unit `status=203/EXEC` "Permission denied" | script not executable | `chmod 755 /usr/local/bin/applespi-force` |
 | `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
+| lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
 
 ---
 
